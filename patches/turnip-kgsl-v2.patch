@@ -2,55 +2,47 @@
 # Generated 2026-08-14. Two parts, two different repos:
 #
 #  PART 1 — Mesa driver (apply in mesa-for-android-container, base 77f4ac30a5f)
-#   12 files: KGSL v2 performance optimizations + KHR_display disable
+#   12 files: KGSL v2 performance optimizations; KHR_display is kept
+#   advertised and the KGSL backend no longer rejects it, so
+#   vkmark/vulkaninfo work as on upstream lfdevs.
 #   apply:   cd mesa-for-android-container && git apply <this file>
 #
 #  PART 2 — vkmark (apply in vkmark repo, version 2025.01)
-#   1 file:  window_system_loader.cpp dlclose-during-unwind fix (wayland segfault)
+#   1 file:  window_system_loader.cpp dlclose-during-unwind fix (safety net)
 #   apply:   cd vkmark && git apply <this file>
 #
 # NOTE: the two parts touch no common paths; apply each in its own repo.
 ====================================================================
 diff --git a/meson.build b/meson.build
-index 6b7414d8909..d47ebc8f16f 100644
+index 6b7414d8909..a15eb319b14 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -319,6 +319,12 @@ with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk
+@@ -319,6 +319,11 @@ with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk
  with_gallium_or_lvp = with_gallium or with_swrast_vk
  
  freedreno_kmds = get_option('freedreno-kmds')
-+# Whether to build the VK_KHR_display WSI platform. Turned off when the
-+# turnip build includes the KGSL KMD below: the KGSL backend rejects
-+# KHR_display at device enumeration ("I can't KHR_display"), so
-+# advertising it would make apps that enable every advertised instance
-+# extension (e.g. vulkaninfo) fail to enumerate any GPU.
++# Keep the VK_KHR_display WSI platform advertised for all freedreno
++# builds. The KGSL backend no longer rejects it at device enumeration, so
++# window-system probes (e.g. vkmark's display probe) behave as on
++# upstream and apps that enable every advertised extension work.
 +with_vulkan_display_wsi = true
  if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedreno_vk
    if freedreno_kmds.contains('msm')
        warning('Turnip with the DRM KMD will require libdrm to always be present at runtime which may not always be the case on platforms such as Android.')
-@@ -327,10 +333,18 @@ if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedre
+@@ -327,9 +332,10 @@ if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedre
    elif _vulkan_drivers != [ 'freedreno' ]
        warning('Turnip is forced to link with libdrm when built alongside other Vulkan drivers which platforms such as Android may not have available at runtime.')
    else
 -    # If DRM support isn't needed, we can get rid of it since linking
 -    # to libdrm can be a potential compatibility hazard.
 -    system_has_kms_drm = false
--  endif
 +    # Keep KMS/DRM support (and thus libdrm) even for KGSL-only builds:
 +    # the WSI DRM image path (headless/swapchain buffer blitting) is
 +    # needed for rendering inside Android containers, and libdrm is
 +    # present on the container distributions we target.
-+    with_vulkan_display_wsi = false
-+  endif
-+endif
-+# The turnip KGSL backend rejects VK_KHR_display at device enumeration
-+# ("I can't KHR_display") no matter which other KMDs the build includes
-+# (e.g. kgsl+msm), so never advertise it when KGSL is built.
-+if with_freedreno_vk and freedreno_kmds.contains('kgsl')
-+    with_vulkan_display_wsi = false
+   endif
  endif
  
- pre_args += ['-DMESA_SYSTEM_HAS_KMS_DRM=@0@'.format(system_has_kms_drm.to_int())]
 diff --git a/src/freedreno/drm/kgsl/kgsl_pipe.c b/src/freedreno/drm/kgsl/kgsl_pipe.c
 index d48f186eb06..47130c66c81 100644
 --- a/src/freedreno/drm/kgsl/kgsl_pipe.c
@@ -155,7 +147,7 @@ index 592519e97b7..b18b62fb19a 100644
     uint64_t fault_count;
  
 diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
-index c261bf3a1e2..166a80c7b15 100644
+index c261bf3a1e2..80f45af3a10 100644
 --- a/src/freedreno/vulkan/tu_knl_kgsl.cc
 +++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
 @@ -9,6 +9,8 @@
@@ -624,6 +616,22 @@ index c261bf3a1e2..166a80c7b15 100644
  }
  
  static const struct tu_knl kgsl_knl_funcs = {
+@@ -1715,11 +2034,10 @@ tu_kgsl_get_raytracing(int fd)
+ VkResult
+ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
+ {
+-   if (instance->vk.enabled_extensions.KHR_display) {
+-      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+-                       "I can't KHR_display");
+-   }
+-
++   /* No longer reject VK_KHR_display here: the KGSL backend simply has no
++    * display support, but advertising the extension (as upstream does) is
++    * what window-system probes expect; actual display-surface creation
++    * will fail normally at use time. */
+    struct tu_physical_device *device = (struct tu_physical_device *)
+       vk_zalloc(&instance->vk.alloc, sizeof(*device), 8,
+                 VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
 diff --git a/src/vulkan/meson.build b/src/vulkan/meson.build
 index 614a33a47c6..ddfdb39746e 100644
 --- a/src/vulkan/meson.build
