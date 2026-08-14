@@ -1,3 +1,16 @@
+===== ALL CHANGES IN ONE PATCH — Mesa turnip/KGSL + vkmark =====
+# Generated 2026-08-14. Two parts, two different repos:
+#
+#  PART 1 — Mesa driver (apply in mesa-for-android-container, base 77f4ac30a5f)
+#   12 files: KGSL v2 performance optimizations + KHR_display disable
+#   apply:   cd mesa-for-android-container && git apply <this file>
+#
+#  PART 2 — vkmark (apply in vkmark repo, version 2025.01)
+#   1 file:  window_system_loader.cpp dlclose-during-unwind fix (wayland segfault)
+#   apply:   cd vkmark && git apply <this file>
+#
+# NOTE: the two parts touch no common paths; apply each in its own repo.
+====================================================================
 diff --git a/meson.build b/meson.build
 index 6b7414d8909..d47ebc8f16f 100644
 --- a/meson.build
@@ -960,3 +973,37 @@ index 0b90eacca85..00004b1a2dc 100644
     /**
      * Optional semaphore for implicit-sync swapchains.  It will be signaled by
 
+diff --git a/src/window_system_loader.cpp b/src/window_system_loader.cpp
+index 9f2efe1..07141d4 100644
+--- a/src/window_system_loader.cpp
++++ b/src/window_system_loader.cpp
+@@ -199,7 +199,28 @@ void WindowSystemLoader::for_each_window_system(ForeachCallback const& callback)
+     for (auto const& c : candidates)
+     {
+         auto const handle = LibHandle{dlopen(c.c_str(), RTLD_LAZY), close_lib};
+-        callback(c, handle.get());
++        try
++        {
++            callback(c, handle.get());
++        }
++        catch (std::exception const& e)
++        {
++            /* A callback (e.g. a window system probe) may throw from code
++             * inside the plugin. The plugin is unloaded at the end of this
++             * iteration, which would leave any in-flight exception object
++             * dangling: its typeinfo/vtable lives in the plugin, so a
++             * handler that inspects it (e.g. main() calling e.what())
++             * would crash. Treat a failing plugin as "not usable" instead
++             * of propagating. e.what() is safe here because the plugin is
++             * still loaded. */
++            Log::warning("WindowSystemLoader: plugin '%s' failed: %s\n",
++                         c.c_str(), e.what());
++        }
++        catch (...)
++        {
++            Log::warning("WindowSystemLoader: plugin '%s' threw a "
++                         "non-standard exception\n", c.c_str());
++        }
+     }
+ }
+ 

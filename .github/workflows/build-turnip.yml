@@ -66,7 +66,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -179,7 +181,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -298,7 +302,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -415,7 +421,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -533,7 +541,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -650,7 +660,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -781,7 +793,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -885,7 +899,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -981,7 +997,9 @@ jobs:
         shell: bash
         run: |
           cd ~/mesa-for-android-container
-          git apply patches/turnip-kgsl-v2.patch
+          # Combined mesa+vkmark patch: apply only the mesa part here
+          # (src/window_system_loader.cpp belongs to the separate vkmark repo).
+          git apply --exclude=src/window_system_loader.cpp patches/turnip-kgsl-v2.patch
 
       - name: Build and Package Mesa in Alpine Container
         run: |
