@@ -62,6 +62,12 @@ jobs:
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_debian_trixie_arm64" >> "$GITHUB_ENV"
 
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
+
       - name: Build Mesa
         shell: bash
         run: |
@@ -168,6 +174,12 @@ jobs:
           version=$(grep -v '^[[:space:]]*$' VERSION | head -n1)
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_ubuntu_noble_arm64" >> "$GITHUB_ENV"
+
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -282,6 +294,12 @@ jobs:
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_ubuntu_questing_arm64" >> "$GITHUB_ENV"
 
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
+
       - name: Build Mesa
         shell: bash
         run: |
@@ -392,6 +410,12 @@ jobs:
           version=$(grep -v '^[[:space:]]*$' VERSION | head -n1)
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_ubuntu_resolute_arm64" >> "$GITHUB_ENV"
+
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -505,6 +529,12 @@ jobs:
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_fedora_43_arm64" >> "$GITHUB_ENV"
 
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
+
       - name: Build Mesa
         shell: bash
         run: |
@@ -615,6 +645,12 @@ jobs:
           version=$(grep -v '^[[:space:]]*$' VERSION | head -n1)
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_fedora_44_arm64" >> "$GITHUB_ENV"
+
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
 
       - name: Build Mesa
         shell: bash
@@ -741,6 +777,12 @@ jobs:
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-devel-${build_date}_archlinux_arm64" >> "$GITHUB_ENV"
 
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
+
       - name: Build Mesa
         shell: bash
         run: |
@@ -839,6 +881,12 @@ jobs:
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_void_arm64" >> "$GITHUB_ENV"
 
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
+
       - name: Build Mesa
         shell: bash
         run: |
@@ -928,6 +976,12 @@ jobs:
           version=$(grep -v '^[[:space:]]*$' VERSION | head -n1)
           build_date=$(TZ=Asia/Shanghai date +%Y%m%d)
           echo "MESA_RELEASE_NAME_SUFFIX=${version}-${build_date}_alpine_3.24_arm64" >> "$GITHUB_ENV"
+
+      - name: Apply turnip patches
+        shell: bash
+        run: |
+          cd ~/mesa-for-android-container
+          git apply patches/turnip-kgsl-v2.patch
 
       - name: Build and Package Mesa in Alpine Container
         run: |

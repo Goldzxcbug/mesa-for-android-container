@@ -1,0 +1,962 @@
+diff --git a/meson.build b/meson.build
+index 6b7414d8909..d47ebc8f16f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -319,6 +319,12 @@ with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk
+ with_gallium_or_lvp = with_gallium or with_swrast_vk
+ 
+ freedreno_kmds = get_option('freedreno-kmds')
++# Whether to build the VK_KHR_display WSI platform. Turned off when the
++# turnip build includes the KGSL KMD below: the KGSL backend rejects
++# KHR_display at device enumeration ("I can't KHR_display"), so
++# advertising it would make apps that enable every advertised instance
++# extension (e.g. vulkaninfo) fail to enumerate any GPU.
++with_vulkan_display_wsi = true
+ if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedreno_vk
+   if freedreno_kmds.contains('msm')
+       warning('Turnip with the DRM KMD will require libdrm to always be present at runtime which may not always be the case on platforms such as Android.')
+@@ -327,10 +333,18 @@ if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedre
+   elif _vulkan_drivers != [ 'freedreno' ]
+       warning('Turnip is forced to link with libdrm when built alongside other Vulkan drivers which platforms such as Android may not have available at runtime.')
+   else
+-    # If DRM support isn't needed, we can get rid of it since linking
+-    # to libdrm can be a potential compatibility hazard.
+-    system_has_kms_drm = false
+-  endif
++    # Keep KMS/DRM support (and thus libdrm) even for KGSL-only builds:
++    # the WSI DRM image path (headless/swapchain buffer blitting) is
++    # needed for rendering inside Android containers, and libdrm is
++    # present on the container distributions we target.
++    with_vulkan_display_wsi = false
++  endif
++endif
++# The turnip KGSL backend rejects VK_KHR_display at device enumeration
++# ("I can't KHR_display") no matter which other KMDs the build includes
++# (e.g. kgsl+msm), so never advertise it when KGSL is built.
++if with_freedreno_vk and freedreno_kmds.contains('kgsl')
++    with_vulkan_display_wsi = false
+ endif
+ 
+ pre_args += ['-DMESA_SYSTEM_HAS_KMS_DRM=@0@'.format(system_has_kms_drm.to_int())]
+diff --git a/src/freedreno/drm/kgsl/kgsl_pipe.c b/src/freedreno/drm/kgsl/kgsl_pipe.c
+index d48f186eb06..47130c66c81 100644
+--- a/src/freedreno/drm/kgsl/kgsl_pipe.c
++++ b/src/freedreno/drm/kgsl/kgsl_pipe.c
+@@ -1,6 +1,12 @@
+ #include "kgsl_priv.h"
+ #include "freedreno_ringbuffer_sp.h"
+ 
++/* How long to busy-poll the retired GPU timestamp in userspace before
++ * falling back to the blocking KGSL wait. See the same fast path in
++ * tu_knl_kgsl.cc (which is tunable via MESA_TU_KGSL_SPIN_US).
++ */
++#define KGSL_SPIN_WAIT_DEFAULT_NS (200 * 1000) /* 200 us */
++
+ /* TODO this function is borrowed from turnip, can it be shared in some way? */
+ int
+ kgsl_pipe_safe_ioctl(int fd, unsigned long request, void *arg)
+@@ -18,12 +24,67 @@ kgsl_pipe_safe_ioctl(int fd, unsigned long request, void *arg)
+  * safe_ioctl is not enough as restarted waits would not adjust the timeout
+  * which could lead to waiting substantially longer than requested
+  */
++
++/* return true if timestamp a is greater (more recent) then b.
++ * KGSL timestamps are 32-bit and wrap; this relies on timestamps never
++ * having a difference > (1<<31). Same helper as turnip's timestamp_cmp.
++ */
++static inline bool
++kgsl_timestamp_cmp(uint32_t a, uint32_t b)
++{
++   return (int32_t) (a - b) >= 0;
++}
++
+ static int
+ wait_timestamp_safe(int fd,
+                     unsigned int context_id,
+                     unsigned int timestamp,
+                     int64_t timeout_ms)
+ {
++   /* A zero timeout is a poll. KGSL's WAITTIMESTAMP treats timeout==0 as
++    * "block until retired", so answer with one READTIMESTAMP instead.
++    */
++   if (timeout_ms == 0) {
++      struct kgsl_cmdstream_readtimestamp_ctxtid read = {
++         .context_id = context_id,
++         .type = KGSL_TIMESTAMP_RETIRED,
++      };
++
++      if (kgsl_pipe_safe_ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID,
++                               &read) == 0 &&
++          kgsl_timestamp_cmp(read.timestamp, timestamp))
++         return 0;
++
++      errno = ETIME;
++      return -1;
++   }
++
++   /* Fast path: busy-poll the retired timestamp in userspace before
++    * blocking in the kernel, which avoids the kernel-side wakeup latency
++    * for short waits. Also taken for negative (infinite) timeouts, which
++    * are the common fd_pipe_wait path. Falls back to the blocking wait
++    * below if the GPU hasn't finished within the spin budget (so long
++    * waits don't burn CPU), or if the kernel doesn't support
++    * READTIMESTAMP.
++    */
++   {
++      uint64_t spin_end = os_time_get_nano() + KGSL_SPIN_WAIT_DEFAULT_NS;
++
++      while (os_time_get_nano() < spin_end) {
++         struct kgsl_cmdstream_readtimestamp_ctxtid read = {
++            .context_id = context_id,
++            .type = KGSL_TIMESTAMP_RETIRED,
++         };
++
++         if (kgsl_pipe_safe_ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID,
++                                  &read) != 0)
++            break; /* no READTIMESTAMP: don't spin on a failing ioctl */
++
++         if (kgsl_timestamp_cmp(read.timestamp, timestamp))
++            return 0;
++      }
++   }
++
+    int64_t start_time = os_time_get_nano();
+    struct kgsl_device_waittimestamp_ctxtid wait = {
+       .context_id = context_id,
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 592519e97b7..b18b62fb19a 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -467,6 +467,13 @@ struct tu_device
+ 
+    uint32_t submit_count;
+ 
++   /* KGSL: cached GPU reset status (see kgsl_device_check_status). Accessed
++    * with relaxed atomics from any waiting thread; staleness is bounded by
++    * the cache window there. Result is stored before the timestamp so a
++    * reader that sees a fresh timestamp sees the matching result. */
++   uint64_t kgsl_reset_status_check_ns;
++   int32_t kgsl_reset_status_cached; /* VkResult */
++
+    /* Address space and global fault count for this local_fd with DRM backend */
+    uint64_t fault_count;
+ 
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index c261bf3a1e2..166a80c7b15 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -9,6 +9,8 @@
+ #include <fcntl.h>
+ #include <poll.h>
+ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <linux/dma-heap.h>
+@@ -21,6 +23,8 @@
+ #include "vk_util.h"
+ 
+ #include "util/os_file.h"
++#include "util/stack_array.h"
++#include "util/u_atomic.h"
+ #include "util/u_debug.h"
+ #include "util/u_vector.h"
+ #include "util/libsync.h"
+@@ -712,6 +716,71 @@ get_relative_ms(uint64_t abs_timeout_ns)
+    return abs_timeout_ms - cur_time_ms;
+ }
+ 
++/* How long to busy-poll the retired GPU timestamp in userspace before
++ * falling back to the blocking KGSL wait below. KGSL's kernel-side wait
++ * wakes up at a coarse polling granularity, so for short waits (e.g.
++ * headless benchmark frames, where the GPU only needs a few tens of
++ * microseconds) the wakeup latency dominates the total wait time. Polling
++ * the timestamp with READTIMESTAMP avoids that entirely.
++ *
++ * Override with MESA_TU_KGSL_SPIN_US.
++ */
++#define KGSL_SPIN_WAIT_DEFAULT_NS (200 * 1000) /* 200 us */
++
++static int64_t
++kgsl_spin_wait_ns(void)
++{
++   /* Parsed once; getenv on every wait adds a measurable per-frame cost.
++    * A racing first call computes the same value, so the store is benign. */
++   static int64_t cached = -1;
++
++   if (cached < 0) {
++      int64_t ns = KGSL_SPIN_WAIT_DEFAULT_NS;
++      const char *spin_us = getenv("MESA_TU_KGSL_SPIN_US");
++
++      if (spin_us) {
++         char *end = NULL;
++         long val = strtol(spin_us, &end, 10);
++
++         /* val == 0 disables the spin entirely. */
++         if (end != spin_us && val >= 0)
++            ns = (int64_t)val * 1000;
++      }
++
++      cached = ns;
++   }
++
++   return cached;
++}
++
++/* Debug timing: MESA_TU_KGSL_DEBUG_TIMING=1 prints the per-frame CPU cost
++ * of queue submit, the GPU command ioctl, and fence waits (every 500
++ * frames), to find where per-frame CPU time goes.
++ */
++static uint64_t kgsl_dbg_ns_submit, kgsl_dbg_ns_submit_ioctl, kgsl_dbg_ns_wait;
++static uint32_t kgsl_dbg_frames;
++static uint64_t kgsl_dbg_n_cmds;
++
++static void
++kgsl_dbg_print(void)
++{
++   if (kgsl_dbg_frames < 500)
++      return;
++
++   fprintf(stderr,
++           "KGSL_TIMING per frame (%u frames): submit=%llu us "
++           "gpu_cmd_ioctl=%llu us wait=%llu us cmds=%llu\n",
++           kgsl_dbg_frames,
++           (unsigned long long)(kgsl_dbg_ns_submit / kgsl_dbg_frames / 1000),
++           (unsigned long long)(kgsl_dbg_ns_submit_ioctl / kgsl_dbg_frames / 1000),
++           (unsigned long long)(kgsl_dbg_ns_wait / kgsl_dbg_frames / 1000),
++           (unsigned long long)(kgsl_dbg_n_cmds / kgsl_dbg_frames));
++
++   kgsl_dbg_ns_submit = kgsl_dbg_ns_submit_ioctl = kgsl_dbg_ns_wait = 0;
++   kgsl_dbg_n_cmds = 0;
++   kgsl_dbg_frames = 0;
++}
++
+ /* safe_ioctl is not enough as restarted waits would not adjust the timeout
+  * which could lead to waiting substantially longer than requested
+  */
+@@ -721,12 +790,71 @@ wait_timestamp_safe(int fd,
+                     unsigned int timestamp,
+                     uint64_t abs_timeout_ns)
+ {
++   /* Fast path: busy-poll the retired timestamp in userspace before
++    * blocking in the kernel, which avoids the kernel-side wakeup latency
++    * for short waits. Falls back to the blocking wait below if the GPU
++    * hasn't finished within the spin budget (so long waits don't burn
++    * CPU), or if the kernel doesn't support READTIMESTAMP.
++    *
++    * Only spin while the caller's deadline is still in the future: a
++    * timeout of zero is a Vulkan-mandated non-blocking poll, and an
++    * already-expired deadline must not overshoot by the spin budget.
++    */
++   int64_t spin_budget = kgsl_spin_wait_ns();
++   uint64_t now = os_time_get_nano();
++
++   if (spin_budget > 0 && abs_timeout_ns > now) {
++      uint64_t spin_end = now + spin_budget;
++      if (spin_end > abs_timeout_ns)
++         spin_end = abs_timeout_ns;
++
++      while (os_time_get_nano() < spin_end) {
++         struct kgsl_cmdstream_readtimestamp_ctxtid read = {
++            .context_id = context_id,
++            .type = KGSL_TIMESTAMP_RETIRED,
++         };
++
++         if (safe_ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID,
++                        &read) != 0)
++            break; /* no READTIMESTAMP: don't spin on a failing ioctl */
++
++         /* KGSL timestamps are 32-bit and wrap; plain >= would report
++          * pre-wrap retired values as satisfying a post-wrap target. */
++         if (timestamp_cmp(read.timestamp, timestamp))
++            return VK_SUCCESS;
++      }
++   }
++
+    struct kgsl_device_waittimestamp_ctxtid wait = {
+       .context_id = context_id,
+       .timestamp = timestamp,
+       .timeout = get_relative_ms(abs_timeout_ns),
+    };
+ 
++   /* KGSL's WAITTIMESTAMP treats timeout==0 as "block until retired", not
++    * as a poll. For a genuinely expired deadline answer with one
++    * READTIMESTAMP poll instead of blocking for up to a full frame; for a
++    * live sub-millisecond remainder (truncated to 0 by the ms conversion)
++    * round up to 1 ms so we neither block forever nor time out early.
++    */
++   if (wait.timeout == 0) {
++      if (abs_timeout_ns > os_time_get_nano()) {
++         wait.timeout = 1;
++      } else {
++         struct kgsl_cmdstream_readtimestamp_ctxtid read = {
++            .context_id = context_id,
++            .type = KGSL_TIMESTAMP_RETIRED,
++         };
++
++         if (safe_ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID,
++                        &read) == 0 &&
++             timestamp_cmp(read.timestamp, timestamp))
++            return VK_SUCCESS;
++
++         return VK_TIMEOUT;
++      }
++   }
++
+    while (true) {
+       int ret = ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+ 
+@@ -751,10 +879,19 @@ VkResult
+ kgsl_queue_wait_fence(struct tu_queue *queue, uint32_t fence,
+                       uint64_t timeout_ns)
+ {
+-   uint64_t abs_timeout_ns = os_time_get_nano() + timeout_ns;
++   uint64_t now = os_time_get_nano();
++   uint64_t abs_timeout_ns =
++      timeout_ns >= UINT64_MAX - now ? UINT64_MAX : now + timeout_ns;
++
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++   VkResult result = wait_timestamp_safe(queue->device->fd,
++                                         queue->msm_queue_id,
++                                         fence, abs_timeout_ns);
++   if (dbg_on)
++      kgsl_dbg_ns_wait += os_time_get_nano() - dbg_t0;
+ 
+-   return wait_timestamp_safe(queue->device->fd, queue->msm_queue_id,
+-                              fence, abs_timeout_ns);
++   return result;
+ }
+ 
+ static VkResult
+@@ -768,8 +905,21 @@ kgsl_syncobj_wait(struct tu_device *device,
+        * avoids needing kernel support for wait-before-signal semantics.
+        */
+ 
+-      if (abs_timeout_ns == 0)
++      bool dbg_unsig_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++      uint64_t dbg_unsig_t0 = dbg_unsig_on ? os_time_get_nano() : 0;
++
++      if (abs_timeout_ns == 0) {
++         if (dbg_unsig_on) {
++            static uint64_t ns, cnt;
++            ns += os_time_get_nano() - dbg_unsig_t0;
++            if (++cnt >= 500) {
++               fprintf(stderr, "VK_TIMING kgsl_unsignaled_poll=%llu us\n",
++                       (unsigned long long)(ns / cnt / 1000));
++               ns = cnt = 0;
++            }
++         }
+          return VK_TIMEOUT; // If this is a simple poll then we can return early
++      }
+ 
+       pthread_mutex_lock(&device->submit_mutex);
+       struct timespec abstime;
+@@ -787,11 +937,30 @@ kgsl_syncobj_wait(struct tu_device *device,
+          if (ret != 0) {
+             assert(ret == ETIMEDOUT);
+             pthread_mutex_unlock(&device->submit_mutex);
++            if (dbg_unsig_on) {
++               static uint64_t ns, cnt;
++               ns += os_time_get_nano() - dbg_unsig_t0;
++               if (++cnt >= 500) {
++                  fprintf(stderr, "VK_TIMING kgsl_unsignaled_cond=%llu us\n",
++                          (unsigned long long)(ns / cnt / 1000));
++                  ns = cnt = 0;
++               }
++            }
+             return VK_TIMEOUT;
+          }
+       }
+ 
+       pthread_mutex_unlock(&device->submit_mutex);
++
++      if (dbg_unsig_on) {
++         static uint64_t ns, cnt;
++         ns += os_time_get_nano() - dbg_unsig_t0;
++         if (++cnt >= 500) {
++            fprintf(stderr, "VK_TIMING kgsl_unsignaled_cond=%llu us\n",
++                    (unsigned long long)(ns / cnt / 1000));
++            ns = cnt = 0;
++         }
++      }
+    }
+ 
+    switch (s->state) {
+@@ -807,7 +976,44 @@ kgsl_syncobj_wait(struct tu_device *device,
+    }
+ 
+    case KGSL_SYNCOBJ_STATE_FD: {
++      bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++      uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++
++      /* Fast path: busy-poll the sync file before blocking in the kernel.
++       * The kernel wakeup after the GPU signals the fence can take tens of
++       * microseconds on Android, which dominates short waits. Polling with
++       * a zero timeout in userspace avoids that wakeup latency entirely.
++       * Only while the deadline is in the future, clamped to it; POLLERR/
++       * POLLNVAL are handed to sync_wait so errors stay errors.
++       */
++      int64_t spin_budget = kgsl_spin_wait_ns();
++      uint64_t now = os_time_get_nano();
++
++      if (spin_budget > 0 && abs_timeout_ns > now) {
++         uint64_t spin_end = now + spin_budget;
++         if (spin_end > abs_timeout_ns)
++            spin_end = abs_timeout_ns;
++
++         while (os_time_get_nano() < spin_end) {
++            struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
++            int n = poll(&pfd, 1, 0);
++            if (n > 0) {
++               if (pfd.revents & (POLLERR | POLLNVAL))
++                  break;
++               if (dbg_on)
++                  kgsl_dbg_ns_wait += os_time_get_nano() - dbg_t0;
++               return VK_SUCCESS;
++            } else if (n < 0 && errno != EINTR && errno != EAGAIN) {
++               break;
++            }
++         }
++      }
++
++      /* Recompute after the spin so the blocking wait doesn't overshoot
++       * the caller's deadline by the spin budget. */
+       int ret = sync_wait(s->fd, get_relative_ms(abs_timeout_ns));
++      if (dbg_on)
++         kgsl_dbg_ns_wait += os_time_get_nano() - dbg_t0;
+       if (ret) {
+          assert(errno == ETIME);
+          return VK_TIMEOUT;
+@@ -1203,6 +1409,74 @@ const struct vk_sync_type vk_kgsl_sync_type = {
+    .export_sync_file = vk_kgsl_sync_export_sync_file,
+ };
+ 
++/* vk_device::copy_sync_payloads for KGSL. KGSL syncobjs are plain
++ * userspace state (a queue timestamp, a sync-file fd, or a constant), so
++ * "submit with no command buffers" reduces to a CPU-side merge of the wait
++ * payloads copied into each signal. Having this hook lets
++ * wsi_queue_submit2_unordered skip the whole vkQueueSubmit2 for the WSI
++ * present submit (which carries no command buffers with headless no_blit),
++ * removing one deferred-queue round trip per frame.
++ */
++static VkResult
++vk_kgsl_sync_copy_payloads(struct vk_device *device,
++                           uint32_t wait_count,
++                           const struct vk_sync_wait *waits,
++                           uint32_t signal_count,
++                           const struct vk_sync_signal *signals)
++{
++   if (signal_count == 0)
++      return VK_SUCCESS;
++
++   STACK_ARRAY(const struct kgsl_syncobj *, wait_syncobjs, wait_count);
++
++   uint32_t real_wait_count = 0;
++   for (uint32_t i = 0; i < wait_count; i++) {
++      /* Non-KGSL syncs (e.g. vk_sync_dummy from a fallback acquire) carry
++       * no payload and are always signaled; skip them. */
++      if (waits[i].sync->type != &vk_kgsl_sync_type)
++         continue;
++
++      wait_syncobjs[real_wait_count++] =
++         &container_of(waits[i].sync, struct vk_kgsl_syncobj, vk)->syncobj;
++   }
++
++   /* Union of all waits; same-queue timestamps fold to max_ts without any
++    * kernel round trip. */
++   struct kgsl_syncobj merged =
++      kgsl_syncobj_merge(wait_syncobjs, real_wait_count);
++
++   struct tu_device *tu_dev = container_of(device, struct tu_device, vk);
++
++   /* Syncobj state stores are done under submit_mutex like the queue
++    * submit path, and CPU waiters parked in the UNSIGNALED cond-wait are
++    * only ever woken by a broadcast - do both, or a waiter of e.g. a
++    * present fence could miss this CPU-side signal entirely. */
++   pthread_mutex_lock(&tu_dev->submit_mutex);
++
++   for (uint32_t i = 0; i < signal_count; i++) {
++      assert(signals[i].sync->type == &vk_kgsl_sync_type);
++
++      struct kgsl_syncobj *s =
++         &container_of(signals[i].sync, struct vk_kgsl_syncobj, vk)->syncobj;
++
++      kgsl_syncobj_reset(s);
++
++      struct kgsl_syncobj copy = kgsl_syncobj_dup(&merged);
++      s->state = copy.state;
++      s->queue = copy.queue;
++      s->timestamp = copy.timestamp;
++      s->fd = copy.fd;
++   }
++
++   pthread_cond_broadcast(&tu_dev->timeline_cond);
++   pthread_mutex_unlock(&tu_dev->submit_mutex);
++
++   kgsl_syncobj_destroy(&merged);
++   STACK_ARRAY_FINISH(wait_syncobjs);
++
++   return VK_SUCCESS;
++}
++
+ struct tu_kgsl_queue_submit {
+    struct util_dynarray commands;
+    struct util_dynarray ranges;
+@@ -1329,6 +1603,9 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+    struct tu_kgsl_queue_submit *submit =
+       (struct tu_kgsl_queue_submit *)_submit;
+ 
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++
+ #if HAVE_PERFETTO
+    uint64_t start_ts = tu_perfetto_begin_submit();
+ #endif
+@@ -1499,8 +1776,11 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+          req.numobjs = obj_idx;
+       }
+ 
++      uint64_t dbg_t1 = dbg_on ? os_time_get_nano() : 0;
+       ret = safe_ioctl(queue->device->physical_device->local_fd,
+                        IOCTL_KGSL_GPU_COMMAND, &req);
++      if (dbg_on)
++         kgsl_dbg_ns_submit_ioctl += os_time_get_nano() - dbg_t1;
+ 
+       timestamp = req.timestamp;
+    } else {
+@@ -1611,6 +1891,14 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+       submission_data->gpu_ts_offset = gpu_offset;
+    }
+ 
++   if (dbg_on) {
++      kgsl_dbg_ns_submit += os_time_get_nano() - dbg_t0;
++      kgsl_dbg_n_cmds += util_dynarray_num_elements(&submit->commands,
++                                                    struct kgsl_command_object);
++      kgsl_dbg_frames++;
++      kgsl_dbg_print();
++   }
++
+ fail_submit:
+    if (result != VK_SUCCESS && u_trace_submission_data) {
+       mtx_lock(&queue->device->kgsl_profiling_mutex);
+@@ -1626,6 +1914,7 @@ static VkResult
+ kgsl_device_init(struct tu_device *dev)
+ {
+    dev->fd = dev->physical_device->local_fd;
++   dev->vk.copy_sync_payloads = vk_kgsl_sync_copy_payloads;
+    return VK_SUCCESS;
+ }
+ 
+@@ -1650,9 +1939,29 @@ kgsl_device_get_suspend_count(struct tu_device *dev, uint64_t *suspend_count)
+    return 0;
+ }
+ 
++/* Cache the GPU reset status briefly. vk_common_WaitForFences,
++ * vk_common_QueueWaitIdle and vk_common_WaitSemaphores call this on every
++ * operation, which costs a GETPROPERTY ioctl each time (several per frame
++ * for a headless benchmark). The reset status doesn't change at that rate,
++ * so caching it for a few milliseconds removes most of those ioctls.
++ * The cache lives in tu_device (not a process-global): with multiple
++ * devices a shared cache could report one device's loss on a healthy
++ * device, or let a busy healthy device starve another device's real
++ * fault query forever.
++ */
++#define KGSL_RESET_STATUS_CACHE_NS (5 * 1000000) /* 5 ms */
++
+ static VkResult
+ kgsl_device_check_status(struct tu_device *device)
+ {
++   uint64_t now = os_time_get_nano();
++   uint64_t last = p_atomic_read(&device->kgsl_reset_status_check_ns);
++
++   if (now - last < KGSL_RESET_STATUS_CACHE_NS)
++      return (VkResult) p_atomic_read(&device->kgsl_reset_status_cached);
++
++   VkResult result = VK_SUCCESS;
++
+    for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
+       for (unsigned q = 0; q < device->queue_count[i]; q++) {
+          /* KGSL's KGSL_PROP_GPU_RESET_STAT takes the u32 msm_queue_id and returns a
+@@ -1662,17 +1971,27 @@ kgsl_device_check_status(struct tu_device *device)
+          uint32_t value = device->queues[i][q].msm_queue_id;
+          VkResult status = get_kgsl_prop(device->fd, KGSL_PROP_GPU_RESET_STAT,
+                                        &value, sizeof(value));
+-         if (status != VK_SUCCESS)
+-            return vk_device_set_lost(&device->vk, "Failed to get GPU reset status");
++         if (status != VK_SUCCESS) {
++            result = vk_device_set_lost(&device->vk,
++                                        "Failed to get GPU reset status");
++            goto out;
++         }
+ 
+          if (value != KGSL_CTX_STAT_NO_ERROR &&
+             value != KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT) {
+-            return vk_device_set_lost(&device->vk, "GPU faulted or hung");
++            result = vk_device_set_lost(&device->vk, "GPU faulted or hung");
++            goto out;
+          }
+       }
+    }
+ 
+-   return VK_SUCCESS;
++out:
++   /* Result before timestamp: a reader that sees a fresh timestamp must
++    * also see the matching result. Staleness is bounded by the cache
++    * window either way. */
++   p_atomic_set(&device->kgsl_reset_status_cached, (int32_t) result);
++   p_atomic_set(&device->kgsl_reset_status_check_ns, now);
++   return result;
+ }
+ 
+ static const struct tu_knl kgsl_knl_funcs = {
+diff --git a/src/vulkan/meson.build b/src/vulkan/meson.build
+index 614a33a47c6..ddfdb39746e 100644
+--- a/src/vulkan/meson.build
++++ b/src/vulkan/meson.build
+@@ -54,7 +54,7 @@ if with_platform_wayland
+   vulkan_wsi_deps += dep_wayland_client
+   vulkan_wsi_list += '-DVK_USE_PLATFORM_WAYLAND_KHR'
+ endif
+-if system_has_kms_drm and not with_platform_android
++if system_has_kms_drm and not with_platform_android and with_vulkan_display_wsi
+   vulkan_wsi_deps += [dep_libdrm, dep_display_info]
+   vulkan_wsi_list += '-DVK_USE_PLATFORM_DISPLAY_KHR'
+ endif
+diff --git a/src/vulkan/runtime/vk_fence.c b/src/vulkan/runtime/vk_fence.c
+index 8e43ea09e10..c3fa1718531 100644
+--- a/src/vulkan/runtime/vk_fence.c
++++ b/src/vulkan/runtime/vk_fence.c
+@@ -257,6 +257,9 @@ vk_common_WaitForFences(VkDevice _device,
+ 
+    VK_FROM_HANDLE(vk_device, device, _device);
+ 
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++
+    if (vk_device_is_lost(device))
+       return VK_ERROR_DEVICE_LOST;
+ 
+@@ -288,6 +291,16 @@ vk_common_WaitForFences(VkDevice _device,
+    if (device_status != VK_SUCCESS)
+       return device_status;
+ 
++   if (dbg_on) {
++      static uint64_t dbg_ns, dbg_cnt;
++      dbg_ns += os_time_get_nano() - dbg_t0;
++      if (++dbg_cnt >= 500) {
++         fprintf(stderr, "VK_TIMING WaitForFences=%llu us\n",
++                 (unsigned long long)(dbg_ns / dbg_cnt / 1000));
++         dbg_ns = dbg_cnt = 0;
++      }
++   }
++
+    return result;
+ }
+ 
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index eee0816141f..d80724c5f6b 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -1244,6 +1244,16 @@ vk_common_QueueSubmit2(VkQueue _queue,
+    VK_FROM_HANDLE(vk_fence, fence, _fence);
+    VkResult result;
+ 
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++   static uint64_t dbg_ns_submit, dbg_ns_interval, dbg_cnt, dbg_last;
++   if (dbg_on) {
++      uint64_t now = os_time_get_nano();
++      if (dbg_last)
++         dbg_ns_interval += now - dbg_last;
++      dbg_last = now;
++   }
++
+    if (vk_device_is_lost(queue->base.device))
+       return VK_ERROR_DEVICE_LOST;
+ 
+@@ -1283,6 +1293,20 @@ vk_common_QueueSubmit2(VkQueue _queue,
+          return result;
+    }
+ 
++   if (dbg_on) {
++      dbg_ns_submit += os_time_get_nano() - dbg_t0;
++      if (++dbg_cnt >= 500) {
++         fprintf(stderr,
++                 "VK_TIMING QueueSubmit=%llu us frame_interval=%llu us "
++                 "(submits=%u cmds=%u)\n",
++                 (unsigned long long)(dbg_ns_submit / dbg_cnt / 1000),
++                 (unsigned long long)(dbg_ns_interval / dbg_cnt / 1000),
++                 submitCount,
++                 submitCount ? pSubmits[0].commandBufferInfoCount : 0);
++         dbg_ns_submit = dbg_ns_interval = dbg_cnt = 0;
++      }
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 38a83d08eab..bbfaef094fc 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -37,7 +37,7 @@ if with_platform_macos
+   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
+ endif
+ 
+-if system_has_kms_drm and not with_platform_android
++if system_has_kms_drm and not with_platform_android and with_vulkan_display_wsi
+   files_vulkan_wsi += files('wsi_common_display.c')
+ endif
+ 
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 44367b6b80b..d26b07c4a96 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -507,6 +507,7 @@ wsi_swapchain_init(const struct wsi_device *wsi,
+    chain->present_wait_enabled =
+       device->enabled_features.presentWait ||
+       (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR);
++   chain->no_throttle = image_params->no_throttle;
+ 
+    chain->blit.queue = NULL;
+    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT ||
+@@ -1843,6 +1844,9 @@ wsi_AcquireNextImageKHR(VkDevice _device,
+    MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(vk_device, device, _device);
+ 
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++
+    const VkAcquireNextImageInfoKHR acquire_info = {
+       .sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
+       .swapchain = swapchain,
+@@ -1852,8 +1856,20 @@ wsi_AcquireNextImageKHR(VkDevice _device,
+       .deviceMask = 0,
+    };
+ 
+-   return device->dispatch_table.AcquireNextImage2KHR(_device, &acquire_info,
+-                                                      pImageIndex);
++   VkResult result = device->dispatch_table.AcquireNextImage2KHR(
++      _device, &acquire_info, pImageIndex);
++
++   if (dbg_on) {
++      static uint64_t ns, cnt;
++      ns += os_time_get_nano() - dbg_t0;
++      if (++cnt >= 500) {
++         fprintf(stderr, "VK_TIMING Acquire=%llu us\n",
++                 (unsigned long long)(ns / cnt / 1000));
++         ns = cnt = 0;
++      }
++   }
++
++   return result;
+ }
+ 
+ static VkResult
+@@ -1870,15 +1886,21 @@ wsi_signal_semaphore_for_image(struct vk_device *device,
+    vk_semaphore_reset_temporary(device, semaphore);
+ 
+ #ifdef HAVE_LIBDRM
+-   VkResult result = chain->image_info.explicit_sync ?
+-      wsi_create_sync_for_image_syncobj(chain, image,
+-                                        VK_SYNC_FEATURE_GPU_WAIT,
+-                                        &semaphore->temporary) :
+-      wsi_create_sync_for_dma_buf_wait(chain, image,
+-                                       VK_SYNC_FEATURE_GPU_WAIT,
+-                                       &semaphore->temporary);
+-   if (result != VK_ERROR_FEATURE_NOT_PRESENT)
+-      return result;
++   /* no_throttle (headless) swapchains have no presentation engine that
++    * could still be reading the image: nothing ever attaches fences to the
++    * image dma-buf, so exporting a sync-file per acquire is a wasted ioctl
++    * plus fd churn. Fall through to the always-signaled dummy sync. */
++   if (!chain->no_throttle) {
++      VkResult result = chain->image_info.explicit_sync ?
++         wsi_create_sync_for_image_syncobj(chain, image,
++                                           VK_SYNC_FEATURE_GPU_WAIT,
++                                           &semaphore->temporary) :
++         wsi_create_sync_for_dma_buf_wait(chain, image,
++                                          VK_SYNC_FEATURE_GPU_WAIT,
++                                          &semaphore->temporary);
++      if (result != VK_ERROR_FEATURE_NOT_PRESENT)
++         return result;
++   }
+ #endif
+ 
+    return vk_sync_create(device, &vk_sync_dummy_type,
+@@ -1900,15 +1922,19 @@ wsi_signal_fence_for_image(struct vk_device *device,
+    vk_fence_reset_temporary(device, fence);
+ 
+ #ifdef HAVE_LIBDRM
+-   VkResult result = chain->image_info.explicit_sync ?
+-      wsi_create_sync_for_image_syncobj(chain, image,
+-                                        VK_SYNC_FEATURE_CPU_WAIT,
+-                                        &fence->temporary) :
+-      wsi_create_sync_for_dma_buf_wait(chain, image,
+-                                       VK_SYNC_FEATURE_CPU_WAIT,
+-                                       &fence->temporary);
+-   if (result != VK_ERROR_FEATURE_NOT_PRESENT)
+-      return result;
++   /* See wsi_signal_semaphore_for_image: no_throttle swapchains never have
++    * fences attached to the image dma-buf, use the dummy sync directly. */
++   if (!chain->no_throttle) {
++      VkResult result = chain->image_info.explicit_sync ?
++         wsi_create_sync_for_image_syncobj(chain, image,
++                                           VK_SYNC_FEATURE_CPU_WAIT,
++                                           &fence->temporary) :
++         wsi_create_sync_for_dma_buf_wait(chain, image,
++                                          VK_SYNC_FEATURE_CPU_WAIT,
++                                          &fence->temporary);
++      if (result != VK_ERROR_FEATURE_NOT_PRESENT)
++         return result;
++   }
+ #endif
+ 
+    return vk_sync_create(device, &vk_sync_dummy_type,
+@@ -2097,6 +2123,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);
+       uint32_t image_index = pPresentInfo->pImageIndices[i];
+ 
++      if (swapchain->no_throttle)
++         continue;
++
+       if (swapchain->fences[image_index] == VK_NULL_HANDLE) {
+          const VkFenceCreateInfo fence_info = {
+             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+@@ -2228,8 +2257,13 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ 
+       wsi_image_signal_info_init(&image_signal_infos[i]);
+ 
+-      wsi_image_signal_info_add_fence(&image_signal_infos[i],
+-                                      swapchain->fences[image_index]);
++      /* With no_throttle the throttle fence is never created; don't push
++       * VK_NULL_HANDLE into the signal list (copy_sync_payloads paths
++       * dereference every listed fence). */
++      if (swapchain->fences[image_index] != VK_NULL_HANDLE) {
++         wsi_image_signal_info_add_fence(&image_signal_infos[i],
++                                         swapchain->fences[image_index]);
++      }
+ 
+       if (swapchain->image_info.explicit_sync) {
+          /* We will signal this acquire value ourselves when GPU work is done. */
+@@ -2535,8 +2569,24 @@ wsi_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+    MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(vk_queue, queue, _queue);
+ 
+-   return wsi_common_queue_present(queue->base.device->physical->wsi_device,
+-                                   queue, pPresentInfo);
++   bool dbg_on = getenv("MESA_TU_KGSL_DEBUG_TIMING") != NULL;
++   uint64_t dbg_t0 = dbg_on ? os_time_get_nano() : 0;
++
++   VkResult result =
++      wsi_common_queue_present(queue->base.device->physical->wsi_device,
++                               queue, pPresentInfo);
++
++   if (dbg_on) {
++      static uint64_t ns, cnt;
++      ns += os_time_get_nano() - dbg_t0;
++      if (++cnt >= 500) {
++         fprintf(stderr, "VK_TIMING Present=%llu us\n",
++                 (unsigned long long)(ns / cnt / 1000));
++         ns = cnt = 0;
++      }
++   }
++
++   return result;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index 5c862bb0b8e..4fa86d39cbf 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -367,6 +367,13 @@ wsi_destroy_image_explicit_sync_drm(const struct wsi_swapchain *chain,
+ VkResult
+ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
+ {
++   /* Headless swapchains have a no-op present, so the pre-present
++    * dma-buf sync submit (one extra GPU submit + fence wait per frame)
++    * is pure overhead.
++    */
++   if (chain->no_throttle)
++      return VK_SUCCESS;
++
+    /* We don't need implicit sync if explicit sync is available through the
+     * window system protocol.
+     */
+@@ -893,6 +900,9 @@ bool
+ wsi_drm_image_needs_buffer_blit(const struct wsi_device *wsi,
+                                 const struct wsi_drm_image_params *params)
+ {
++   if (params->no_blit)
++      return false;
++
+    if (WSI_DEBUG & WSI_DEBUG_BUFFER)
+       return true;
+ 
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index d410cd9aa50..b70d656d73a 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -436,7 +436,14 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ 
+    struct wsi_drm_image_params drm_params = {
+       .base.image_type = WSI_IMAGE_TYPE_DRM,
++      /* Headless present is a no-op: no throttle waits and no dma-buf
++       * implicit-sync pre-present submit. Travels through the image params
++       * because wsi_swapchain_init memsets the chain before reading it. */
++      .base.no_throttle = true,
+       .same_gpu = true,
++      /* Headless present is a no-op, so the swapchain images never need
++       * to be read by the CPU. Skip the buffer-blit path entirely. */
++      .no_blit = true,
+       .num_modifier_lists = mod_list.drmFormatModifierCount > 0 ? 1 : 0,
+       .num_modifiers = &mod_list.drmFormatModifierCount,
+       .modifiers = (const uint64_t **)&mods,
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 0b90eacca85..00004b1a2dc 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -53,6 +53,14 @@ enum wsi_image_type {
+ 
+ struct wsi_base_image_params {
+    enum wsi_image_type image_type;
++
++   /* Skip present throttling and dma-buf implicit sync for this swapchain.
++    * Set by backends whose present is a no-op (headless): the app already
++    * serializes on its render fence, so a present fence only adds latency.
++    * Copied into wsi_swapchain::no_throttle by wsi_swapchain_init (the
++    * swapchain struct itself is memset at the top of init, so the flag must
++    * travel through the image params, not be pre-set on the chain). */
++   bool no_throttle;
+ };
+ 
+ struct wsi_cpu_image_params {
+@@ -68,6 +76,12 @@ struct wsi_drm_image_params {
+    /* See wsi_image_info.explicit_sync. */
+    bool explicit_sync;
+ 
++   /* Skip the buffer-blit path even without DRM modifiers / scanout.
++    * Used by headless surfaces, whose present is a no-op and thus never
++    * needs CPU-readable linear buffers. Saves one extra blit render and
++    * fence wait per frame. */
++   bool no_blit;
++
+    uint32_t num_modifier_lists;
+    const uint32_t *num_modifiers;
+    const uint64_t *const *modifiers;
+@@ -232,6 +246,11 @@ struct wsi_swapchain {
+    VkSemaphore present_id_timeline;
+    bool present_wait_enabled;
+ 
++   /* Skip the present throttle waits. Used by headless swapchains, whose
++    * present is a no-op: the app already serializes on its render fence,
++    * so waiting on a present fence just wastes a frame's worth of latency. */
++   bool no_throttle;
++
+    int signal_dma_buf_from_semaphore;
+    /**
+     * Optional semaphore for implicit-sync swapchains.  It will be signaled by
+
